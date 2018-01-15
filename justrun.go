@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -77,7 +78,7 @@ func main() {
 	go waitForInterrupt(sigCh, cmd)
 
 	cmdCh := make(chan event, 100)
-	_, err := watch(inputPaths, ignoreFlag, cmdCh)
+	userPaths, err := watch(inputPaths, ignoreFlag, cmdCh)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -85,6 +86,8 @@ func main() {
 	wasDelayed := false
 
 	lastStartTime := time.Now()
+	changedFiles := make(map[string]bool, 0)
+	mustChange := false
 	cmd.Reload()
 	tick := time.NewTicker(*delayDur)
 	for {
@@ -92,6 +95,11 @@ func main() {
 		case ev, ok := <-cmdCh:
 			if !ok {
 				return
+			}
+			if h, ok := userPaths[ev.Event.Name]; !ok || h == nil {
+				mustChange = true
+			} else {
+				changedFiles[ev.Event.Name] = true
 			}
 			if lastStartTime.After(ev.Time) {
 				continue
@@ -104,6 +112,8 @@ func main() {
 				continue
 			}
 			wasDelayed = false
+			mustChange = false
+			changedFiles = map[string]bool{}
 			lastStartTime = time.Now()
 			cmd.Reload()
 			tick.Stop()
@@ -112,6 +122,30 @@ func main() {
 			if wasDelayed {
 				wasDelayed = false
 				lastStartTime = time.Now()
+				if mustChange == false && len(changedFiles) < 512 {
+					allEqual := true
+					// check hashes.
+					for name := range changedFiles {
+						d, err := digest(name)
+						if err != nil {
+							allEqual = false
+							break
+						}
+						if !bytes.Equal(d, userPaths[name]) {
+							// store the new digest, keep searching so we get
+							// new digest for all files.
+							userPaths[name] = d
+							allEqual = false
+						}
+					}
+					mustChange = false
+					l := len(changedFiles)
+					changedFiles = map[string]bool{}
+					if allEqual {
+						log.Printf("%d files changed but all have same contents, continuing", l)
+						continue
+					}
+				}
 				cmd.Reload()
 			}
 		}

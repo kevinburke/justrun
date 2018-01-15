@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -11,9 +15,36 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+const maxHashedFileSize = 20 * 1024 * 1024
+
+func digest(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.IsDir() {
+		return nil, nil
+	}
+	h := sha256.New()
+	br := bufio.NewReader(f)
+	if _, err := io.Copy(h, io.LimitReader(br, maxHashedFileSize)); err != nil {
+		return nil, err
+	}
+	if b, _ := br.Peek(1); len(b) > 0 {
+		// too big
+		return nil, nil
+	}
+	return h.Sum(nil), nil
+}
+
 // watch watches the input paths. The returned Watcher should only be used in
 // tests.
-func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Watcher, error) {
+func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (map[string][]byte, error) {
 	// Creates an Ignorer that just ignores file paths the user
 	// specifically asked to be ignored.
 	ui, err := createUserIgnorer(ignoredPaths)
@@ -29,7 +60,7 @@ func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Wat
 	// Watch user-specified paths and create a set of them for walking
 	// later. Paths that are both asked to be watched and ignored by
 	// the user are ignored.
-	userPaths := make(map[string]bool)
+	userPaths := make(map[string][]byte)
 	includedHiddenFiles := make(map[string]bool)
 	for _, path := range inputPaths {
 		fullPath, err := filepath.Abs(path)
@@ -37,7 +68,8 @@ func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Wat
 			w.Close()
 			return nil, errors.New("unable to get current working directory while working with user-watched paths")
 		}
-		if userPaths[fullPath] || ui.IsIgnored(path) {
+		_, found := userPaths[fullPath]
+		if found || ui.IsIgnored(path) {
 			continue
 		}
 		err = w.Add(fullPath)
@@ -45,7 +77,8 @@ func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Wat
 			w.Close()
 			return nil, fmt.Errorf("unable to watch '%s': %s", path, err)
 		}
-		userPaths[fullPath] = true
+		d, _ := digest(fullPath)
+		userPaths[fullPath] = d
 	}
 
 	// Create some useful sets from the user-specified paths to be
@@ -73,7 +106,8 @@ func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Wat
 		}
 
 		dirPath := filepath.Dir(fullPath)
-		if !userPaths[dirPath] && dirPath != "" {
+		_, foundDir := userPaths[dirPath]
+		if !foundDir && dirPath != "" {
 			if !renameDirs[dirPath] {
 				err = w.Add(dirPath)
 				if err != nil {
@@ -93,7 +127,7 @@ func watch(inputPaths, ignoredPaths []string, cmdCh chan<- event) (*fsnotify.Wat
 	}
 
 	go listenForEvents(w, cmdCh, ig)
-	return w, nil
+	return userPaths, nil
 }
 
 type event struct {
